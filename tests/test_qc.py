@@ -78,6 +78,32 @@ class SummaryCountsHashedOut(unittest.TestCase):
         self.assertEqual(bounds.verdict(310), qc.NEEDS_DETAIL)
         self.assertEqual(bounds.verdict(320), qc.MUST_NOT_EXCEED)
 
+    def test_counter_snapshot_matches_readings_snapshot(self):
+        class Counter:
+            def __init__(self, values):
+                self.values = sorted(values)
+                self.n = len(values)
+
+            def count_le(self, t):
+                import bisect
+                return bisect.bisect_right(self.values, t)
+
+            def count_ge(self, t):
+                import bisect
+                return self.n - bisect.bisect_left(self.values, t)
+
+        vals = [4, 9, 1, 9, 7]
+        n, mn, p, mx = qc.readings_stats(vals)
+        plain = qc.CoilSnapshot(0, "C0", n, mn, p, mx, detail_id=1,
+                                readings=tuple(sorted(vals)))
+        counted = qc.CoilSnapshot(0, "C0", n, mn, p, mx, detail_id=1,
+                                  counter=Counter(vals))
+        summary = qc.CoilSnapshot(1, "C1", 4, 2, 8, 8, summary_id=1)
+        self.assertEqual(qc.batch_bounds([plain, summary]),
+                         qc.batch_bounds([counted, summary]))
+        self.assertEqual(counted.kind, "detail")
+        self.assertTrue(counted.has_detail)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -124,20 +124,31 @@ class CoilSnapshot:
     readings: Optional[Sequence[int]] = None
     # readings are sorted ascending when supplied
 
+    # A detail may instead be represented by a counter object exposing
+    # ``count_le(t)``/``count_ge(t)``/``n``.  This lets the application keep a
+    # detail's readings off the heap after it has been read once (see
+    # ``app.DiskDetailCounter``); ``batch_bounds`` only ever queries one coil at
+    # a time.
+    counter: Optional[object] = None
+
     @property
     def has_detail(self) -> bool:
-        return self.readings is not None
+        return self.readings is not None or self.counter is not None
 
     @property
     def kind(self) -> str:
         return "detail" if self.has_detail else "summary"
 
     def count_le(self, t: int) -> int:
+        if self.counter is not None:
+            return self.counter.count_le(t)
         if self.readings is not None:
             return bisect_right(self.readings, t)
         return max_count_le_summary(self.n, self.mn, self.p, self.mx, t)
 
     def count_ge(self, t: int) -> int:
+        if self.counter is not None:
+            return self.counter.count_ge(t)
         if self.readings is not None:
             return len(self.readings) - bisect_left(self.readings, t)
         return max_count_ge_summary(self.n, self.mn, self.p, self.mx, t)
@@ -205,7 +216,7 @@ def batch_bounds(coils: Iterable[CoilSnapshot]) -> BatchBounds:
     for c in coil_list:
         if c.n <= 0:
             raise ValueError(f"coil {c.coil_no} has no points")
-        if c.readings is None and not summary_feasible(c.n, c.mn, c.p, c.mx):
+        if not c.has_detail and not summary_feasible(c.n, c.mn, c.p, c.mx):
             raise ValueError(f"coil {c.coil_no} has an infeasible summary")
 
     total = sum(c.n for c in coil_list)

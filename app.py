@@ -10,6 +10,9 @@ import json
 import os
 import re
 import sqlite3
+import sys
+import tempfile
+from array import array
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -116,13 +119,29 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def temp_root() -> str:
+    """Directory for temporary detail indexes.
+
+    ``TMPDIR`` wins so Docker can point it at the data volume rather than a
+    small temp filesystem; otherwise the standard temp directory is used.
+    The directory must exist and be writable, so create it up front.
+    """
+    root = os.environ.get("TMPDIR") or tempfile.gettempdir()
+    try:
+        Path(root).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return root
+
+
 def get_db() -> sqlite3.Connection:
     if "db" not in g:
         path = app.config["DATABASE"]
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(path, timeout=15, isolation_level=None)
+        conn = sqlite3.connect(path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 30000")
         conn.execute("PRAGMA journal_mode = WAL")
         g.db = conn
     return g.db
@@ -136,12 +155,18 @@ def close_db(exc):
 
 
 def ensure_schema() -> None:
-    """Create tables once per process, before the first request."""
+    """Create tables once per process, before the first request.
+
+    Gunicorn starts several workers concurrently; each one runs this.  A short
+    busy retry absorbs the brief lock while a sibling worker is creating the
+    tables, so startup cannot fail on a fresh volume.
+    """
     path = app.config["DATABASE"]
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=15, isolation_level=None)
+    conn = sqlite3.connect(path, timeout=30, isolation_level=None)
     try:
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 30000")
         conn.executescript(SCHEMA)
     finally:
         conn.close()
@@ -332,15 +357,25 @@ def fetch_coils(conn, batch_id: int):
 
 def active_summary(conn, coil_id: int):
     return conn.execute(
-        "SELECT * FROM summaries WHERE coil_id = ? AND active = 1 "
-        "ORDER BY id DESC LIMIT 1",
+        "SELECT id, coil_id, point_count, min_um, p95_um, max_um, active, "
+        "retired_reason, retired_at, created_at FROM summaries "
+        "WHERE coil_id = ? AND active = 1 ORDER BY id DESC LIMIT 1",
         (coil_id,),
     ).fetchone()
 
 
-def active_detail(conn, coil_id: int):
+# ``readings`` can be several megabytes per detail.  Listing pages only need
+# the statistics, so they must never select that column.
+DETAIL_META_COLUMNS = (
+    "id, coil_id, point_count, min_um, p95_um, max_um, active, "
+    "retired_reason, retired_at, created_at"
+)
+
+
+def active_detail(conn, coil_id: int, *, with_readings: bool = False):
+    columns = "readings, " + DETAIL_META_COLUMNS if with_readings else DETAIL_META_COLUMNS
     return conn.execute(
-        "SELECT * FROM details WHERE coil_id = ? AND active = 1 "
+        f"SELECT {columns} FROM details WHERE coil_id = ? AND active = 1 "
         "ORDER BY id DESC LIMIT 1",
         (coil_id,),
     ).fetchone()
@@ -392,12 +427,150 @@ def detail_summary_mismatch(detail, summary) -> str | None:
     return "；".join(diffs) if diffs else None
 
 
-def build_snapshot(conn, batch_id: int) -> tuple[list[qc.CoilSnapshot], list[str]]:
+# ---------------------------------------------------------------------------
+# Bounded-memory detail counters
+# ---------------------------------------------------------------------------
+
+class DiskDetailCounter:
+    """Answers ``count_le``/``count_ge`` from a sorted on-disk reading index.
+
+    A detail CSV may hold hundreds of thousands of points.  Keeping the
+    readings (or even a sorted copy) on the Python heap for every coil of a
+    batch makes a determination's memory grow with the batch.  Instead each
+    coil's sorted readings are appended once, as fixed-width integers, to a
+    single anonymous temporary index file, and every count is a binary search
+    there via ``pread``: only a few bytes are held at any moment and the whole
+    batch needs one file descriptor.  Nothing here expands a summary.
+    """
+
+    def __init__(self, fd: int, offset: int, n: int, mn: int, p: int, mx: int,
+                 item_size: int, signed: bool):
+        self._fd = fd
+        self._offset = offset
+        self.n = n
+        self.mn = mn
+        self.p = p
+        self.mx = mx
+        self._size = item_size
+        self._signed = signed
+
+    def _value(self, index: int) -> int:
+        chunk = os.pread(self._fd, self._size, self._offset + index * self._size)
+        return int.from_bytes(chunk, "little", signed=self._signed)
+
+    def _first_ge(self, t: int) -> int:
+        lo, hi = 0, self.n
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._value(mid) < t:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    def _first_gt(self, t: int) -> int:
+        lo, hi = 0, self.n
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._value(mid) <= t:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    def count_le(self, t: int) -> int:
+        return self._first_gt(t)
+
+    def count_ge(self, t: int) -> int:
+        return self.n - self._first_ge(t)
+
+
+class DetailCounterFactory:
+    """Turns a stored detail's JSON readings into a ``DiskDetailCounter``.
+
+    Each call both validates the readings against the stored statistics and
+    appends the sorted index, so the raw JSON is decoded exactly once per
+    detail in a determination.  Peak heap use is proportional to the largest
+    single detail, never to the whole batch.
+    """
+
+    def __init__(self):
+        self._file = tempfile.TemporaryFile(prefix="qc-detail-index-", dir=temp_root())
+        self._next_offset = 0
+
+    def load(self, detail_id: int, raw: str | None) -> DiskDetailCounter | None:
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            values = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(values, list) or not values:
+            return None
+        try:
+            for i, value in enumerate(values):
+                values[i] = int(value)
+            values.sort()
+            n = len(values)
+            k = qc.p95_index(n)
+            mn, p, mx = values[0], values[k - 1], values[-1]
+            if -0x8000_0000 <= mn and mx <= 0x7FFF_FFFF:
+                typecode, size, signed = "i", array("i").itemsize, True
+            elif mn >= 0 and mx <= 0xFFFF_FFFF:
+                typecode, size, signed = "I", array("I").itemsize, False
+            else:
+                typecode, size, signed = "q", array("q").itemsize, True
+            packed = array(typecode, values)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        del values
+        if sys.byteorder != "little":
+            packed.byteswap()
+        # ``array`` itemsize is platform-defined; encode exactly ``size`` bytes
+        # per reading so the on-disk layout matches ``DiskDetailCounter``.
+        if packed.itemsize != size:
+            return None
+
+        self._file.seek(self._next_offset)
+        self._file.write(packed.tobytes())
+        # ``pread`` bypasses the buffered file object, so the bytes must be
+        # flushed before the counter is used.
+        self._file.flush()
+        counter = DiskDetailCounter(
+            self._file.fileno(), self._next_offset, n, mn, p, mx, size, signed
+        )
+        self._next_offset += n * size
+        return counter
+
+    def close(self) -> None:
+        try:
+            self._file.close()
+        except OSError:
+            pass
+
+    def __enter__(self) -> "DetailCounterFactory":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
+def build_snapshot(
+    conn, batch_id: int, counters: "DetailCounterFactory | None" = None
+) -> tuple[list[qc.CoilSnapshot], list[str]]:
     """Resolve every coil to exactly one submitted summary or detail.
 
     The returned snapshots are what a determination is computed from; they are
     read inside the determination transaction and persisted with the result.
+
+    Detail readings are read at most once per coil.  Instead of keeping every
+    coil's readings (or even its sorted copy) on the heap for the whole
+    determination, each enabled detail is written to a small sorted on-disk
+    index (``counters``) and queried by binary search there.  The working
+    memory therefore grows with the largest single coil, not with the batch.
     """
+    if counters is None:
+        counters = DetailCounterFactory()
     coils = fetch_coils(conn, batch_id)
     if not coils:
         raise InputError("该批次还没有卷")
@@ -409,7 +582,9 @@ def build_snapshot(conn, batch_id: int) -> tuple[list[qc.CoilSnapshot], list[str
 
     for coil in coils:
         summary = active_summary(conn, coil["id"])
-        detail = active_detail(conn, coil["id"])
+        detail = active_detail(
+            conn, coil["id"], with_readings=summary is not None
+        )
         if summary is None and detail is None:
             missing.append(coil["coil_no"])
             continue
@@ -425,51 +600,57 @@ def build_snapshot(conn, batch_id: int) -> tuple[list[qc.CoilSnapshot], list[str
             blocked.append(f"卷 {coil['coil_no']} 的摘要无法成立：{problem}")
             continue
 
-        use_detail = False
+        counter = None
         if detail is not None and summary is not None:
             mismatch = detail_summary_mismatch(detail, summary)
-            stored = json.loads(detail["readings"])
-            readings = tuple(sorted(int(v) for v in stored))
-            stats_ok = (
-                len(readings) == detail["point_count"]
-                and readings
-                and qc.readings_stats(readings) == (
-                    detail["point_count"],
-                    detail["min_um"],
-                    detail["p95_um"],
-                    detail["max_um"],
-                )
-            )
-            if mismatch is None and stats_ok:
-                use_detail = True
-            elif mismatch is not None:
+            if mismatch is not None:
                 notes.append(
                     f"卷 {coil['coil_no']} 的明细与当前摘要不符（{mismatch}），"
                     "本次按摘要核算"
                 )
             else:
-                notes.append(
-                    f"卷 {coil['coil_no']} 的明细档案不完整或统计与读数不符，"
-                    "本次退回摘要"
-                )
+                try:
+                    counter = counters.load(detail["id"], detail["readings"])
+                except (TypeError, ValueError):
+                    counter = None
+                if counter is not None:
+                    stored_stats = (
+                        counter.n, counter.mn, counter.p, counter.mx
+                    )
+                    declared_stats = (
+                        detail["point_count"],
+                        detail["min_um"],
+                        detail["p95_um"],
+                        detail["max_um"],
+                    )
+                    if stored_stats != declared_stats:
+                        # The stored readings contradict the stored statistics.
+                        # A pre-existing broken archive is not adopted: ignore
+                        # the detail and account from the summary instead.
+                        counter = None
+                if counter is None:
+                    notes.append(
+                        f"卷 {coil['coil_no']} 的明细档案不完整或统计与读数不符，"
+                        "本次退回摘要"
+                    )
         elif detail is not None:
             notes.append(
                 f"卷 {coil['coil_no']} 只有明细、没有已提交摘要，"
                 "未满足「与摘要相符」的采用条件，本次不采用明细"
             )
 
-        if use_detail:
+        if counter is not None:
             snapshots.append(
                 qc.CoilSnapshot(
                     coil_id=coil["id"],
                     coil_no=coil["coil_no"],
-                    n=detail["point_count"],
-                    mn=detail["min_um"],
-                    p=detail["p95_um"],
-                    mx=detail["max_um"],
+                    n=counter.n,
+                    mn=counter.mn,
+                    p=counter.p,
+                    mx=counter.mx,
                     detail_id=detail["id"],
-                    summary_id=summary["id"] if summary else None,
-                    readings=readings,
+                    summary_id=summary["id"],
+                    counter=counter,
                 )
             )
         elif summary is not None:
@@ -509,8 +690,8 @@ def fetch_coil_views(conn, batch_id: int):
         detail = active_detail(conn, coil["id"])
         mismatch = detail_summary_mismatch(detail, summary) if detail else None
         retired_details = conn.execute(
-            "SELECT * FROM details WHERE coil_id = ? AND active = 0 "
-            "ORDER BY id DESC LIMIT 5",
+            f"SELECT {DETAIL_META_COLUMNS} FROM details "
+            "WHERE coil_id = ? AND active = 0 ORDER BY id DESC LIMIT 5",
             (coil["id"],),
         ).fetchall()
         retired_views = [
@@ -813,7 +994,8 @@ def activate_detail_route(batch_id: int, detail_id: int):
     try:
         fetch_batch(conn, batch_id)
         row = conn.execute(
-            "SELECT d.* FROM details d JOIN coils c ON c.id = d.coil_id "
+            "SELECT d.id, d.coil_id, d.point_count, d.min_um, d.p95_um, "
+            "d.max_um, d.readings FROM details d JOIN coils c ON c.id = d.coil_id "
             "WHERE d.id = ? AND c.batch_id = ?",
             (detail_id, batch_id),
         ).fetchone()
@@ -875,11 +1057,13 @@ def retire_summary_route(batch_id: int, summary_id: int):
 def determine(batch_id: int):
     limit = parse_int(request.form.get("limit_um"), "厚度上限")
     conn = get_db()
+    counters = None
     conn.execute("BEGIN IMMEDIATE")
     try:
         fetch_batch(conn, batch_id)
+        counters = DetailCounterFactory()
         try:
-            snapshots, notes = build_snapshot(conn, batch_id)
+            snapshots, notes = build_snapshot(conn, batch_id, counters)
             bounds = qc.batch_bounds(snapshots)
         except InputError:
             raise
@@ -918,9 +1102,20 @@ def determine(batch_id: int):
         )
         determination_id = cur.lastrowid
         conn.execute("COMMIT")
+    except (MemoryError, OSError) as exc:
+        # Out of memory or out of temporary storage.  Roll back, so no
+        # determination is recorded and every saved one stays readable.
+        app.logger.exception("determination could not be computed or saved")
+        rollback_quiet(conn)
+        raise InputError(
+            "核算或保存所需的资源不足，本次未保存判定；已有判定不受影响"
+        ) from exc
     except Exception:
         rollback_quiet(conn)
         raise
+    finally:
+        if counters is not None:
+            counters.close()
     return redirect(
         url_for("determination_detail", batch_id=batch_id, det_id=determination_id)
     )

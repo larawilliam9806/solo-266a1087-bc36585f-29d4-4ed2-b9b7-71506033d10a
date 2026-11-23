@@ -6,6 +6,9 @@ services:
     environment:
       QC_DB: /data/qc.db
       QC_SECRET: change-me-in-production
+      # Temporary sorted detail indexes live here; keep it off a tiny tmpfs
+      # so a batch with several large coils is not constrained by RAM.
+      TMPDIR: /data/tmp
     volumes:
       - qc-data:/data
     restart: unless-stopped

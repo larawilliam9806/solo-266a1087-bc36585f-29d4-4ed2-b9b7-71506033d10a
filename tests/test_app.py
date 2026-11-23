@@ -204,6 +204,138 @@ class FlowTests(unittest.TestCase):
         count = self.db().execute("SELECT COUNT(*) c FROM determinations").fetchone()["c"]
         self.assertEqual(count, 1)
 
+    def test_detail_is_read_once_per_determination(self):
+        import qc as qcmod
+
+        self.summary("C1", 3, 100, 300, 300)
+        self.detail("C1", b"100\n300\n300\n")
+        self.summary("C2", 2, 100, 300, 300)
+        self.detail("C2", b"100\n300\n")
+
+        loads = []
+        real_loads = appmod.DetailCounterFactory.load
+
+        def counting_load(factory, detail_id, raw):
+            loads.append(detail_id)
+            return real_loads(factory, detail_id, raw)
+
+        appmod.DetailCounterFactory.load = counting_load
+        try:
+            self.determine(300)
+        finally:
+            appmod.DetailCounterFactory.load = real_loads
+        self.assertEqual(len(loads), 2)
+        self.assertEqual(len(set(loads)), 2)
+
+    def test_corrupt_detail_falls_back_to_summary(self):
+        self.summary("C1", 3, 100, 300, 300)
+        self.detail("C1", b"100\n300\n300\n")
+        conn = self.db()
+        conn.execute("UPDATE details SET readings = '[100, 300]'")
+        conn.commit()
+        conn.close()
+        self.determine(300)
+        snap = json.loads(self.last_det()["snapshot_json"])
+        self.assertEqual(snap["coils"][0]["kind"], "summary")
+        self.assertTrue(any("退回摘要" in n for n in snap["notes"]), snap["notes"])
+
+    def test_batch_page_does_not_load_detail_readings(self):
+        self.summary("C1", 2, 100, 300, 300)
+        self.detail("C1", b"100\n300\n")
+        conn = self.db()
+        conn.execute("UPDATE details SET readings = 'not-json'")
+        conn.commit()
+        conn.close()
+        text = self.client.get(f"/batch/{self.bid}").get_data(as_text=True)
+        self.assertIn("C1", text)
+        self.assertNotIn("not-json", text)
+
+    def test_disk_counter_matches_sorted_readings(self):
+        import qc as qcmod
+
+        vals = [300, 100, 150, 150, 280, 150, 150, 150, 150, 150]
+        n, mn, p, mx = qcmod.readings_stats(vals)
+        factory = appmod.DetailCounterFactory()
+        try:
+            counter = factory.load(1, json.dumps(vals))
+            self.assertIsNotNone(counter)
+            self.assertEqual((counter.n, counter.mn, counter.p, counter.mx),
+                             (n, mn, p, mx))
+            ordered = sorted(vals)
+            for t in range(90, 320):
+                le = sum(v <= t for v in ordered)
+                ge = sum(v >= t for v in ordered)
+                self.assertEqual(counter.count_le(t), le, ("le", t))
+                self.assertEqual(counter.count_ge(t), ge, ("ge", t))
+        finally:
+            factory.close()
+
+    def test_disk_counter_handles_multiple_details_in_one_file(self):
+        factory = appmod.DetailCounterFactory()
+        try:
+            first = factory.load(1, json.dumps([5, 1, 9, 3]))
+            second = factory.load(2, json.dumps(list(range(100, 300))))
+            self.assertEqual(first.count_le(4), 2)
+            self.assertEqual(first.count_ge(5), 2)
+            self.assertEqual(second.count_le(199), 100)
+            self.assertEqual(second.count_ge(199), 101)
+            # The first counter is unaffected by appending the second.
+            self.assertEqual(first.count_le(9), 4)
+        finally:
+            factory.close()
+
+    def test_determination_uses_exact_detail_counts(self):
+        # C1 has a real detail whose duplicate-heavy shape would be hidden by
+        # a counter that answered every query with 0 or n.
+        vals = [100] + [150] * 17 + [280, 300]
+        self.summary("C1", 20, 100, 280, 300)
+        raw = ("\n".join(str(v) for v in vals) + "\n").encode()
+        self.detail("C1", raw)
+        self.summary("C2", 20, 100, 500, 500)
+        self.determine(400)
+        d = self.last_det()
+        # 40 readings, k=38.  C1 can put at most 19 readings at or below 280,
+        # C2's P95=500 keeps its 20th point at 500, so 38 readings cannot all
+        # be <= 280: the low end is forced to 300.
+        self.assertEqual((d["min_possible"], d["max_possible"]), (300, 500))
+        self.assertEqual(d["verdict"], "needs_detail")
+        snap = json.loads(d["snapshot_json"])
+        self.assertEqual(snap["coils"][0]["kind"], "detail")
+
+    def test_out_of_memory_during_determine_saves_nothing(self):
+        self.summary("C1", 2, 100, 300, 300)
+        self.detail("C1", b"100\n300\n")
+        self.determine(300)
+        count = self.db().execute(
+            "SELECT COUNT(*) c FROM determinations"
+        ).fetchone()["c"]
+
+        real_load = appmod.DetailCounterFactory.load
+
+        def out_of_memory(factory, detail_id, raw):
+            raise MemoryError()
+
+        appmod.DetailCounterFactory.load = out_of_memory
+        try:
+            text = self.determine(999).get_data(as_text=True)
+        finally:
+            appmod.DetailCounterFactory.load = real_load
+        self.assertIn("未保存判定", text)
+        self.assertEqual(
+            self.db().execute("SELECT COUNT(*) c FROM determinations").fetchone()["c"],
+            count,
+        )
+        # The earlier determination is still readable.
+        old = self.db().execute(
+            "SELECT id FROM determinations ORDER BY id LIMIT 1"
+        ).fetchone()
+        self.assertEqual(
+            self.client.get(
+                f"/batch/{self.bid}/determination/{old['id']}"
+            ).status_code,
+            200,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
